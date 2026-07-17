@@ -23,9 +23,13 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
+#include <dirent.h>
+#include <cctype>
+
 #include "host.h"
 #include "hostVmShared.h"
 #include "nibblehelpers.h"
+#include "filehelpers.h"   /* isCartFile */
 #include "fake08_board.h"
 
 static const char *TAG = "esp32host";
@@ -145,9 +149,30 @@ void   Host::playFilledAudioBuffer() { }
 
 double Host::deltaTMs() { return (double)s_frame_period_us / 1000.0; }
 
-std::vector<std::string> Host::listcarts() { return {}; }
-std::vector<std::string> Host::listdirs()  { return {}; }
-std::string Host::getCartDirectory()       { return ""; }
+/* Scan _cartDirectory (set by the app to the SD mount point) for .p8/.p8.png. opendir failing — no
+ * mount, no card, empty path — returns an empty list, which is the graceful "no SD cart" path (the app
+ * then falls back to the flash cart). Ported from platform/gcw0 (ODHost.cpp:642). */
+std::vector<std::string> Host::listcarts() {
+    std::vector<std::string> carts;
+    DIR *dir;
+    struct dirent *ent;
+    if ((dir = opendir(_cartDirectory.c_str())) != NULL) {
+        while ((ent = readdir(dir)) != NULL) {
+            /* FATFS hands back 8.3 short names UPPERCASE (e.g. HELLO.P8), and isCartFile's .p8/.png check
+             * is case-sensitive — lowercase a copy so uppercase names are recognized. FAT open is itself
+             * case-insensitive, so keep the original-case name in the path we return. */
+            std::string lower(ent->d_name);
+            for (char &c : lower) c = (char)std::tolower((unsigned char)c);
+            if (isCartFile(lower)) {
+                carts.push_back(_cartDirectory + "/" + ent->d_name);
+            }
+        }
+        closedir(dir);
+    }
+    return carts;
+}
+std::vector<std::string> Host::listdirs()  { return {}; } /* not needed for the first-cart milestone */
+std::string Host::getCartDirectory()       { return _cartDirectory; }
 const char *Host::logFilePrefix()          { return ""; }
 std::string Host::customBiosLua()          { return ""; }
 void Host::overrideLogFilePrefix(const char *newPrefix) { (void)newPrefix; }
