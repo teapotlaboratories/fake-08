@@ -98,18 +98,19 @@ void Host::waitForTargetFps() {
 void Host::drawFrame(uint8_t *picoFb, uint8_t *screenPaletteMap, uint8_t drawMode) {
     (void)drawMode; /* draw-only milestone: only the default draw mode */
     if (!s_fb) return;
-    /* The board's display path presents PICO-8 content rotated 90deg (verified on the bench: the L-pattern
-     * cart's top+left bars render as an on-panel "L", and text reads sideways). Pre-rotate 90deg CW here so
-     * carts render upright: pico (x,y) -> scaled buffer (row = 2x, col = 255 - 2y). One blit/frame. */
+    /* Straight mapping: pico (x,y) -> scaled buffer (2x,2y) -> panel, matching the HG display path
+     * (host_main.cpp). The panel renders this UPRIGHT. NOTE: the bench camera is mounted 90deg rotated
+     * (docs bench-rig-gotchas: "LEFT of frame = TOP of panel"), so a raw /capture looks rotated and must
+     * be turned 90deg CW before judging orientation. Do not "correct" for that here. */
     for (int y = 0; y < PICO_H; y++) {
-        int col_base = (DST_W - 1) - y * SCALE; /* 255 - 2y; fills cols col_base and col_base-1 */
+        uint16_t *d0 = s_fb + (y * SCALE) * DST_W;
+        uint16_t *d1 = d0 + DST_W;
         for (int x = 0; x < PICO_W; x++) {
             uint8_t c = getPixelNibble(x, y, picoFb);
             uint16_t col = s_lut[screenPaletteMap[c] & 0x8f];
-            uint16_t *r0 = s_fb + (x * SCALE) * DST_W + col_base;
-            uint16_t *r1 = r0 + DST_W;
-            r0[0] = col; r0[-1] = col;
-            r1[0] = col; r1[-1] = col;
+            int dx = x * SCALE;
+            d0[dx] = col; d0[dx + 1] = col;
+            d1[dx] = col; d1[dx + 1] = col;
         }
     }
     board_lcd_blit(OX, OY, DST_W, DST_H, s_fb);
