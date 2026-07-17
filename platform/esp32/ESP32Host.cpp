@@ -40,7 +40,13 @@ static const char *TAG = "esp32host";
 #define OY     ((480 - DST_H) / 2)  /* 112 */
 
 static uint16_t  s_lut[144];        /* PICO-8 colour index -> RGB565 (board byte order) */
-static uint16_t *s_fb = nullptr;    /* 256x256 scaled RGB565 frame; one blit per frame  */
+
+/* Blit in strips from a small INTERNAL DMA buffer. A full 256x256 fb (128 KB) doesn't fit internal SRAM
+ * and falls back to slow PSRAM (measured: 16.5 ms/frame — the dominant cost). A strip fits internal,
+ * keeping the per-pixel writes AND the blit DMA in fast SRAM. */
+#define STRIP_PR   16                 /* pico rows per strip */
+#define STRIP_ROWS (STRIP_PR * SCALE) /* panel rows per strip (32) */
+static uint16_t *s_strip = nullptr;   /* DST_W * STRIP_ROWS RGB565 (16 KB), internal DMA */
 
 /* Frame pacing (esp_timer). */
 static int64_t s_frame_period_us = 1000000 / 30;
@@ -59,20 +65,21 @@ void Host::oneTimeSetup(Audio *audio) {
     for (int i = 0; i < 144; i++) {
         s_lut[i] = board_lcd_rgb565(_paletteColors[i].Red, _paletteColors[i].Green, _paletteColors[i].Blue);
     }
-    /* Scaled framebuffer: prefer internal DMA-capable SRAM for blit speed, fall back to PSRAM. */
-    s_fb = (uint16_t *)heap_caps_malloc(DST_W * DST_H * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    if (!s_fb) {
-        s_fb = (uint16_t *)heap_caps_malloc(DST_W * DST_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-        ESP_LOGW(TAG, "scaled fb fell back to PSRAM");
+    /* Strip buffer in internal DMA-capable SRAM (16 KB fits; the full 128 KB fb does not — see above). */
+    s_strip = (uint16_t *)heap_caps_malloc(DST_W * STRIP_ROWS * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!s_strip) {
+        s_strip = (uint16_t *)heap_caps_malloc(DST_W * STRIP_ROWS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+        ESP_LOGW(TAG, "strip buffer fell back to PSRAM");
     }
     board_lcd_fill(board_lcd_rgb565(0, 0, 0)); /* clear the letterbox once */
-    ESP_LOGI(TAG, "oneTimeSetup done (fb=%p, %dx%d @ %d,%d)", s_fb, DST_W, DST_H, OX, OY);
+    ESP_LOGI(TAG, "oneTimeSetup done (strip=%p, %dx%d, %d strips @ %d,%d)",
+             s_strip, DST_W, STRIP_ROWS, PICO_H / STRIP_PR, OX, OY);
 }
 
 void Host::oneTimeCleanup() {
-    if (s_fb) {
-        heap_caps_free(s_fb);
-        s_fb = nullptr;
+    if (s_strip) {
+        heap_caps_free(s_strip);
+        s_strip = nullptr;
     }
 }
 
@@ -97,23 +104,28 @@ void Host::waitForTargetFps() {
 
 void Host::drawFrame(uint8_t *picoFb, uint8_t *screenPaletteMap, uint8_t drawMode) {
     (void)drawMode; /* draw-only milestone: only the default draw mode */
-    if (!s_fb) return;
-    /* Straight mapping: pico (x,y) -> scaled buffer (2x,2y) -> panel, matching the HG display path
-     * (host_main.cpp). The panel renders this UPRIGHT. NOTE: the bench camera is mounted 90deg rotated
-     * (docs bench-rig-gotchas: "LEFT of frame = TOP of panel"), so a raw /capture looks rotated and must
-     * be turned 90deg CW before judging orientation. Do not "correct" for that here. */
-    for (int y = 0; y < PICO_H; y++) {
-        uint16_t *d0 = s_fb + (y * SCALE) * DST_W;
-        uint16_t *d1 = d0 + DST_W;
-        for (int x = 0; x < PICO_W; x++) {
-            uint8_t c = getPixelNibble(x, y, picoFb);
-            uint16_t col = s_lut[screenPaletteMap[c] & 0x8f];
-            int dx = x * SCALE;
-            d0[dx] = col; d0[dx + 1] = col;
-            d1[dx] = col; d1[dx + 1] = col;
+    if (!s_strip) return;
+    /* Straight mapping: pico (x,y) -> panel (2x,2y), matching the HG display path (host_main.cpp); the
+     * panel renders this UPRIGHT. Built + blitted in strips so the buffer stays in fast internal SRAM.
+     * The nibble-unpack is inlined (read one byte -> two pixels) to avoid a per-pixel getPixelNibble call.
+     * NOTE: the bench camera is mounted 90deg rotated (bench-rig-gotchas: "LEFT of frame = TOP of panel")
+     * — a raw /capture looks rotated and must be turned 90deg CW before judging. Do not correct it here. */
+    for (int sy = 0; sy < PICO_H; sy += STRIP_PR) {
+        for (int ry = 0; ry < STRIP_PR; ry++) {
+            const uint8_t *src = picoFb + ((sy + ry) << 6); /* pico row base: *64 (4bpp, 2 px/byte) */
+            uint16_t *d0 = s_strip + (ry * SCALE) * DST_W;
+            uint16_t *d1 = d0 + DST_W;
+            for (int x = 0; x < PICO_W; x += 2) {
+                uint8_t b = src[x >> 1];
+                uint16_t c0 = s_lut[screenPaletteMap[b & 0x0f] & 0x8f]; /* even x: low nibble  */
+                uint16_t c1 = s_lut[screenPaletteMap[b >> 4]   & 0x8f]; /* odd  x: high nibble */
+                int dx = x * SCALE;
+                d0[dx] = c0; d0[dx + 1] = c0; d0[dx + 2] = c1; d0[dx + 3] = c1;
+                d1[dx] = c0; d1[dx + 1] = c0; d1[dx + 2] = c1; d1[dx + 3] = c1;
+            }
         }
+        board_lcd_blit(OX, OY + (sy * SCALE), DST_W, STRIP_ROWS, s_strip);
     }
-    board_lcd_blit(OX, OY, DST_W, DST_H, s_fb);
 }
 
 InputState_t Host::scanInput() {
