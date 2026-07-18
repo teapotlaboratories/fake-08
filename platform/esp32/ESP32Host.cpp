@@ -170,9 +170,10 @@ std::vector<std::string> Host::listcarts() {
     struct dirent *ent;
     if ((dir = opendir(_cartDirectory.c_str())) != NULL) {
         while ((ent = readdir(dir)) != NULL) {
-            /* FATFS hands back 8.3 short names UPPERCASE (e.g. HELLO.P8), and isCartFile's .p8/.png check
-             * is case-sensitive — lowercase a copy so uppercase names are recognized. FAT open is itself
-             * case-insensitive, so keep the original-case name in the path we return. */
+            /* isCartFile's .p8/.png check is case-sensitive, but a card's names can be any case — with LFN
+             * (enabled in the app's sdkconfig) readdir returns the real mixed case, and an 8.3 fallback
+             * would be upper — so match on a lowercased copy. FAT open is itself case-insensitive, so keep
+             * the original-case name in the path we return. */
             std::string lower(ent->d_name);
             for (char &c : lower) c = (char)std::tolower((unsigned char)c);
             if (isCartFile(lower)) {
