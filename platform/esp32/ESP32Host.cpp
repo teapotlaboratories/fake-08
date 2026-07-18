@@ -31,6 +31,7 @@
 #include "nibblehelpers.h"
 #include "filehelpers.h"   /* isCartFile */
 #include "fake08_board.h"
+#include "input.h"         /* input_init/input_poll — the compile-time-selectable input backend */
 
 static const char *TAG = "esp32host";
 
@@ -133,8 +134,19 @@ void Host::drawFrame(uint8_t *picoFb, uint8_t *screenPaletteMap, uint8_t drawMod
 }
 
 InputState_t Host::scanInput() {
-    InputState_t s = {}; /* no buttons: KDown=KHeld=0, no mouse, no keyboard -> pause menu never opens */
-    return s;
+    static bool    s_ready = false;
+    static uint8_t s_prevHeld = 0;
+    if (!s_ready) {
+        input_init();                            /* brings up the compiled backend once */
+        ESP_LOGI(TAG, "input backend: %s", input_backend_name());
+        s_ready = true;
+    }
+    uint8_t held = input_poll();                 /* held mask; INPUT_* bits == fake-08 P8_KEY_* order */
+    InputState_t s = {};
+    s.KHeld = held;
+    s.KDown = (uint8_t)(held & ~s_prevHeld);     /* pressed-this-frame edge, shared across all backends */
+    s_prevHeld = held;
+    return s;                                     /* mouse/keyboard stay zeroed (devkit-mode only) */
 }
 
 bool Host::shouldRunMainLoop() { return true; }
