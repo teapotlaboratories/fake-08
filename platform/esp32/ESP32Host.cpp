@@ -53,8 +53,13 @@ static uint16_t  s_lut[144];        /* PICO-8 colour index -> RGB565 (board byte
 #define STRIP_ROWS (STRIP_PR * SCALE) /* panel rows per strip (32) */
 static uint16_t *s_strip = nullptr;   /* DST_W * STRIP_ROWS RGB565 (16 KB), internal DMA */
 
-/* Frame pacing (esp_timer). */
-static int64_t s_frame_period_us = 1000000 / 30;
+/* Frame pacing (esp_timer). fake-08's game loop (__z8_run_cart's glue coroutine) is designed to be
+ * RESUMED AT 60 Hz: a _update60 cart runs one resume per drawn frame (60 fps), and a 30 fps cart
+ * (_update, e.g. Celeste) burns an extra yield() so it runs one drawn frame per TWO resumes — the
+ * coroutine self-divides 60 Hz down to 30 fps. Pacing this at 30 Hz (the old default) therefore ran
+ * 30 fps carts at HALF speed (15 fps of motion). So the host resumes at 60 Hz; the cart's own loop
+ * decides its logical rate. Work is ~6 ms/frame, well inside the 16.6 ms budget. */
+static int64_t s_frame_period_us = 1000000 / 60;
 static int64_t s_next_frame_us   = 0;
 
 Host::Host(int windowWidth, int windowHeight) {
@@ -94,8 +99,29 @@ void Host::setTargetFps(int targetFps) {
     s_next_frame_us = esp_timer_get_time();
 }
 
+#ifdef SHOW_FPS
+extern "C" void board_lcd_draw_fps(int fps);
+#endif
+
 void Host::waitForTargetFps() {
     int64_t now = esp_timer_get_time();
+#ifdef SHOW_FPS
+    /* On-screen FPS HUD: measure the actual loop (render) rate over ~30 frames and repaint it in the
+     * right letterbox only when the integer value changes (the game blit never touches x>=288). */
+    {
+        static int64_t s_last = 0, s_acc = 0;
+        static int s_cnt = 0, s_shown = -1;
+        if (s_last) {
+            s_acc += now - s_last;
+            if (++s_cnt >= 30) {
+                int fps = (int)(1e6 * s_cnt / (double)s_acc + 0.5);
+                if (fps != s_shown) { board_lcd_draw_fps(fps); s_shown = fps; }
+                s_acc = 0; s_cnt = 0;
+            }
+        }
+        s_last = now;
+    }
+#endif
     if (s_next_frame_us == 0) s_next_frame_us = now;
     s_next_frame_us += s_frame_period_us;
     int64_t wait_us = s_next_frame_us - now;
