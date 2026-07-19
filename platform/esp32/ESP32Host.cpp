@@ -42,7 +42,11 @@ static const char *TAG = "esp32host";
 #define DST_W  (PICO_W * SCALE)     /* 256 */
 #define DST_H  (PICO_H * SCALE)     /* 256 */
 #define OX     ((320 - DST_W) / 2)  /* 32  */
+#ifdef CENTER_GAME
+#define OY     ((480 - DST_H) / 2)  /* 112 — vertically centred: no touch deck (e.g. the serial play-test build) */
+#else
 #define OY     0                    /* game flush to the top; the touch control deck owns the bottom 224 px */
+#endif
 
 static uint16_t  s_lut[144];        /* PICO-8 colour index -> RGB565 (board byte order) */
 
