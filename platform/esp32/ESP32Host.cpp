@@ -105,14 +105,17 @@ void Host::setTargetFps(int targetFps) {
 
 #ifdef SHOW_FPS
 extern "C" void board_lcd_draw_fps(int fps);
+extern "C" volatile int g_hud_owned_by_app;   /* set by an app loop that draws a truer game-frame fps itself */
 #endif
 
 void Host::waitForTargetFps() {
     int64_t now = esp_timer_get_time();
 #ifdef SHOW_FPS
-    /* On-screen FPS HUD: measure the actual loop (render) rate over ~30 frames and repaint it in the
-     * right letterbox only when the integer value changes (the game blit never touches x>=288). */
-    {
+    /* On-screen FPS HUD: measure the actual loop (render) rate over ~30 ticks and repaint only when the
+     * integer value changes (the HUD lives outside the game blit region, so it persists). NOTE: this counts
+     * coroutine resumes, which for a 30 fps cart is ~2x the drawn-frame rate — so if an app loop owns the HUD
+     * (g_hud_owned_by_app) and draws the true game-frame fps, this generic meter stands down. */
+    if (!g_hud_owned_by_app) {
         static int64_t s_last = 0, s_acc = 0;
         static int s_cnt = 0, s_shown = -1;
         if (s_last) {
