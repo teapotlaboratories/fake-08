@@ -36,9 +36,9 @@
 static const char *TAG = "esp32host";
 
 /* PICO-8 is 128x128. The integer upscale is chosen at RUNTIME from the panel width — the largest that
- * fits, clamped to [2, MAX_SCALE] — so each board fills more of its glass: S3 320 -> 2x (256x256),
- * P4 480 -> 3x (384x384). Panel geometry + offsets are likewise runtime (the app passes the panel size to
- * the Host ctor); defaults match the S3 so a Host(0,0) still behaves as before. */
+ * fits, clamped to [1, MAX_SCALE] — so each board fills more of its glass without ever exceeding the panel:
+ * S3 320 -> 2x (256x256), P4 480 -> 3x (384x384). Panel geometry + offsets are likewise runtime (the app
+ * passes the panel size to the Host ctor); defaults match the S3 so a Host(0,0) still behaves as before. */
 #define PICO_W    128
 #define PICO_H    128
 #define STRIP_PR  16                  /* pico rows per strip */
@@ -59,7 +59,11 @@ static uint16_t  s_lut[144];        /* PICO-8 colour index -> RGB565 (board byte
  * keeping the per-pixel writes AND the blit DMA there. */
 static uint16_t *s_strip = nullptr;
 
-static int pico_scale(int w) { int s = w / PICO_W; if (s < 2) s = 2; if (s > MAX_SCALE) s = MAX_SCALE; return s; }
+/* Largest integer scale that fits the panel width, clamped to [1, MAX_SCALE]. Flooring at 1 (not 2) means
+ * the game never renders wider than the glass: a <256 px panel gets 1x rather than an oversized 256 px blit
+ * that would overflow. The two real panels are >=320, so both still land on 2x/3x — this only guards the
+ * degenerate narrow case. */
+static int pico_scale(int w) { int s = w / PICO_W; if (s < 1) s = 1; if (s > MAX_SCALE) s = MAX_SCALE; return s; }
 
 /* Frame pacing (esp_timer). fake-08's game loop (__z8_run_cart's glue coroutine) is designed to be
  * RESUMED AT 60 Hz: a _update60 cart runs one resume per drawn frame (60 fps), and a 30 fps cart
