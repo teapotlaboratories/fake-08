@@ -35,27 +35,31 @@
 
 static const char *TAG = "esp32host";
 
-/* PICO-8 is 128x128; the panel is 320x480 portrait. Integer 2x -> 256x256, centred (letterboxed). */
-#define PICO_W 128
-#define PICO_H 128
-#define SCALE  2
-#define DST_W  (PICO_W * SCALE)     /* 256 */
-#define DST_H  (PICO_H * SCALE)     /* 256 */
-#define OX     ((320 - DST_W) / 2)  /* 32  */
-#ifdef CENTER_GAME
-#define OY     ((480 - DST_H) / 2)  /* 112 — vertically centred: no touch deck (e.g. the serial play-test build) */
-#else
-#define OY     0                    /* game flush to the top; the touch control deck owns the bottom 224 px */
-#endif
+/* PICO-8 is 128x128. The integer upscale is chosen at RUNTIME from the panel width — the largest that
+ * fits, clamped to [2, MAX_SCALE] — so each board fills more of its glass: S3 320 -> 2x (256x256),
+ * P4 480 -> 3x (384x384). Panel geometry + offsets are likewise runtime (the app passes the panel size to
+ * the Host ctor); defaults match the S3 so a Host(0,0) still behaves as before. */
+#define PICO_W    128
+#define PICO_H    128
+#define STRIP_PR  16                  /* pico rows per strip */
+#define MAX_SCALE 3                   /* bounds the strip buffer (P4 480-wide -> 3x is the largest today) */
+
+static int s_scale      = 2;          /* PICO_W*s_scale = game width; set in oneTimeSetup */
+static int s_dst_w      = PICO_W * 2; /* 256 by default */
+static int s_dst_h      = PICO_H * 2;
+static int s_strip_rows = STRIP_PR * 2;
+static int s_panel_w    = 320;
+static int s_panel_h    = 480;
+static int s_ox = 0, s_oy = 0;
 
 static uint16_t  s_lut[144];        /* PICO-8 colour index -> RGB565 (board byte order) */
 
-/* Blit in strips from a small INTERNAL DMA buffer. A full 256x256 fb (128 KB) doesn't fit internal SRAM
- * and falls back to slow PSRAM (measured: 16.5 ms/frame — the dominant cost). A strip fits internal,
- * keeping the per-pixel writes AND the blit DMA in fast SRAM. */
-#define STRIP_PR   16                 /* pico rows per strip */
-#define STRIP_ROWS (STRIP_PR * SCALE) /* panel rows per strip (32) */
-static uint16_t *s_strip = nullptr;   /* DST_W * STRIP_ROWS RGB565 (16 KB), internal DMA */
+/* Blit in strips from a small INTERNAL DMA buffer. A full frame buffer doesn't fit internal SRAM and
+ * falls back to slow PSRAM; a strip (s_dst_w * s_strip_rows: 16 KB at 2x, 36 KB at 3x) stays in fast SRAM,
+ * keeping the per-pixel writes AND the blit DMA there. */
+static uint16_t *s_strip = nullptr;
+
+static int pico_scale(int w) { int s = w / PICO_W; if (s < 2) s = 2; if (s > MAX_SCALE) s = MAX_SCALE; return s; }
 
 /* Frame pacing (esp_timer). fake-08's game loop (__z8_run_cart's glue coroutine) is designed to be
  * RESUMED AT 60 Hz: a _update60 cart runs one resume per drawn frame (60 fps), and a 30 fps cart
@@ -67,8 +71,10 @@ static int64_t s_frame_period_us = 1000000 / 60;
 static int64_t s_next_frame_us   = 0;
 
 Host::Host(int windowWidth, int windowHeight) {
-    (void)windowWidth;
-    (void)windowHeight;
+    /* The app passes the board's panel size here (BOARD_LCD_H_RES/V_RES); 0 keeps the S3 default. Used to
+     * centre the game blit at runtime so one host serves any panel geometry. */
+    if (windowWidth > 0)  s_panel_w = windowWidth;
+    if (windowHeight > 0) s_panel_h = windowHeight;
     _cartDirectory = "";
     _logFilePrefix = "";
 }
@@ -79,15 +85,31 @@ void Host::oneTimeSetup(Audio *audio) {
     for (int i = 0; i < 144; i++) {
         s_lut[i] = board_lcd_rgb565(_paletteColors[i].Red, _paletteColors[i].Green, _paletteColors[i].Blue);
     }
-    /* Strip buffer in internal DMA-capable SRAM (16 KB fits; the full 128 KB fb does not — see above). */
-    s_strip = (uint16_t *)heap_caps_malloc(DST_W * STRIP_ROWS * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    /* Pick the integer upscale for this panel, then size the strip buffer for it. */
+    s_scale = pico_scale(s_panel_w);
+    s_dst_w = PICO_W * s_scale;
+    s_dst_h = PICO_H * s_scale;
+    s_strip_rows = STRIP_PR * s_scale;
+    /* Strip buffer in internal DMA-capable SRAM (the full frame buffer does not fit — see above). */
+    s_strip = (uint16_t *)heap_caps_malloc((size_t)s_dst_w * s_strip_rows * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!s_strip) {
-        s_strip = (uint16_t *)heap_caps_malloc(DST_W * STRIP_ROWS * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+        s_strip = (uint16_t *)heap_caps_malloc((size_t)s_dst_w * s_strip_rows * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
         ESP_LOGW(TAG, "strip buffer fell back to PSRAM");
     }
-    board_lcd_fill(board_lcd_rgb565(0, 0, 0)); /* clear the letterbox once */
-    ESP_LOGI(TAG, "oneTimeSetup done (strip=%p, %dx%d, %d strips @ %d,%d)",
-             s_strip, DST_W, STRIP_ROWS, PICO_H / STRIP_PR, OX, OY);
+    /* Centre the game area on this board's panel (computed now that the panel size + scale are known). */
+    s_ox = (s_panel_w - s_dst_w) / 2;
+    if (s_ox < 0) s_ox = 0;
+#ifdef CENTER_GAME
+    s_oy = (s_panel_h - s_dst_h) / 2; /* vertically centred: no touch deck (e.g. the serial play-test build) */
+    if (s_oy < 0) s_oy = 0;
+#else
+    s_oy = 0;                         /* game flush to the top; the touch control deck owns the bottom band */
+#endif
+    board_lcd_fill(board_lcd_rgb565(0x0f, 0x14, 0x1d)); /* fill the letterbox/deck once — subtle dark
+                                                         * surface (mockup's deck colour), not pure black;
+                                                         * the touch deck (input_touch.c) uses the same tone. */
+    ESP_LOGI(TAG, "oneTimeSetup done (strip=%p, %dx%d game @ %d,%d, %dx scale on %dx%d panel)",
+             s_strip, s_dst_w, s_dst_h, s_ox, s_oy, s_scale, s_panel_w, s_panel_h);
 }
 
 void Host::oneTimeCleanup() {
@@ -148,21 +170,23 @@ void Host::drawFrame(uint8_t *picoFb, uint8_t *screenPaletteMap, uint8_t drawMod
      * The nibble-unpack is inlined (read one byte -> two pixels) to avoid a per-pixel getPixelNibble call.
      * NOTE: the bench camera is mounted 90deg rotated (bench-rig-gotchas: "LEFT of frame = TOP of panel")
      * — a raw /capture looks rotated and must be turned 90deg CW before judging. Do not correct it here. */
+    const int sc = s_scale;
     for (int sy = 0; sy < PICO_H; sy += STRIP_PR) {
         for (int ry = 0; ry < STRIP_PR; ry++) {
             const uint8_t *src = picoFb + ((sy + ry) << 6); /* pico row base: *64 (4bpp, 2 px/byte) */
-            uint16_t *d0 = s_strip + (ry * SCALE) * DST_W;
-            uint16_t *d1 = d0 + DST_W;
+            uint16_t *row0 = s_strip + (ry * sc) * s_dst_w; /* first of `sc` destination rows */
             for (int x = 0; x < PICO_W; x += 2) {
                 uint8_t b = src[x >> 1];
                 uint16_t c0 = s_lut[screenPaletteMap[b & 0x0f] & 0x8f]; /* even x: low nibble  */
                 uint16_t c1 = s_lut[screenPaletteMap[b >> 4]   & 0x8f]; /* odd  x: high nibble */
-                int dx = x * SCALE;
-                d0[dx] = c0; d0[dx + 1] = c0; d0[dx + 2] = c1; d0[dx + 3] = c1;
-                d1[dx] = c0; d1[dx + 1] = c0; d1[dx + 2] = c1; d1[dx + 3] = c1;
+                int dx = x * sc;
+                for (int k = 0; k < sc; k++) row0[dx + k] = c0;         /* sc horizontal copies each */
+                for (int k = 0; k < sc; k++) row0[dx + sc + k] = c1;
             }
+            for (int k = 1; k < sc; k++)                                /* replicate the row `sc-1` times */
+                memcpy(row0 + (size_t)k * s_dst_w, row0, (size_t)s_dst_w * sizeof(uint16_t));
         }
-        board_lcd_blit(OX, OY + (sy * SCALE), DST_W, STRIP_ROWS, s_strip);
+        board_lcd_blit(s_ox, s_oy + (sy * sc), s_dst_w, s_strip_rows, s_strip);
     }
 }
 
