@@ -124,15 +124,11 @@ void Host::oneTimeSetup(Audio *audio) {
         s_strip = (uint16_t *)heap_caps_malloc((size_t)s_dst_w * s_strip_rows * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
         ESP_LOGW(TAG, "strip buffer fell back to PSRAM");
     }
-    /* Centre the game area on this board's panel (computed now that the panel size + scale are known). */
+    /* Horizontally centre the game on the panel (an integer upscale can be narrower than the glass), and
+     * put it flush to the TOP — the control deck (if any) owns the band below. Always flush-top now. */
     s_ox = (s_panel_w - s_dst_w) / 2;
     if (s_ox < 0) s_ox = 0;
-#ifdef CENTER_GAME
-    s_oy = (s_panel_h - s_dst_h) / 2; /* vertically centred: no touch deck (e.g. the serial play-test build) */
-    if (s_oy < 0) s_oy = 0;
-#else
-    s_oy = 0;                         /* game flush to the top; the touch control deck owns the bottom band */
-#endif
+    s_oy = 0;
     board_lcd_fill(board_lcd_rgb565(0x0f, 0x14, 0x1d)); /* fill the letterbox/deck once — subtle dark
                                                          * surface (mockup's deck colour), not pure black;
                                                          * the touch deck (input_touch.c) uses the same tone. */
