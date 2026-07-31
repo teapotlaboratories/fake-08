@@ -8,6 +8,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>   /* size_t */
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +23,12 @@ void board_lcd_fill(uint16_t color);
 
 /* RGB888 -> RGB565 in the board's bus byte order. Build the palette LUT with this. */
 uint16_t board_lcd_rgb565(uint8_t r, uint8_t g, uint8_t b);
+
+/* Audio output seam (optional). board_audio_init() returns 0 (ESP_OK) if this board has working audio
+ * output; a board with none returns non-zero and the Host stays silent. board_audio_write() plays `frames`
+ * stereo 16-bit frames, blocking until queued — which self-paces the caller to the audio clock. */
+int  board_audio_init(void);
+void board_audio_write(const int16_t *stereo, size_t frames);
 
 #ifdef __cplusplus
 }

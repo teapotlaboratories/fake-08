@@ -59,6 +59,30 @@ static uint16_t  s_lut[144];        /* PICO-8 colour index -> RGB565 (board byte
  * keeping the per-pixel writes AND the blit DMA there. */
 static uint16_t *s_strip = nullptr;
 
+/* Audio runs on a task pinned to CORE 1, decoupled from the game loop (core 0). fake-08's per-sample synth
+ * uses double math, which is soft-float on the P4's single-precision FPU (~10 ms per buffer); running it
+ * inline in the game loop pushed the loop past its 16.6 ms/60 Hz budget and played everything ~10% slow.
+ * The task generates a buffer then does a BLOCKING I2S write, which self-paces it to the 22050 Hz clock;
+ * core 0 is then free to hold 60 Hz. Buffer is AUDIO_FRAMES stereo frames (uint32 each). */
+#define AUDIO_FRAMES 368
+static bool         s_audio_ok   = false;
+static int16_t     *s_audio_buf  = nullptr;
+static Audio       *s_audio      = nullptr;   /* fake-08's synth engine (passed to oneTimeSetup) */
+static TaskHandle_t s_audio_task = nullptr;
+
+/* LOCK-FREE by design: this task reads/advances the Audio engine on core 1 while the game loop mutates it
+ * on core 0 (sfx()/music() from the cart). No mutex — PICO-8's audio state is fixed-size (4 sfx channels +
+ * one music channel; pattern indices are always -1..63, no realloc/pointers), so a torn cross-core read is
+ * at worst a one-buffer audio glitch, never an out-of-bounds. If artifacts ever appear under heavy
+ * sfx/music churn, guard the FillAudioBuffer + sfx/music paths with a lightweight critical section. */
+static void audio_task(void *arg) {
+    (void)arg;
+    while (true) {
+        s_audio->FillAudioBuffer(s_audio_buf, 0, AUDIO_FRAMES);   /* synthesis (soft-float doubles) on core 1 */
+        board_audio_write(s_audio_buf, AUDIO_FRAMES);             /* blocking I2S write paces to 22050 Hz */
+    }
+}
+
 /* Largest integer scale that fits the panel width, clamped to [1, MAX_SCALE]. Flooring at 1 (not 2) means
  * the game never renders wider than the glass: a <256 px panel gets 1x rather than an oversized 256 px blit
  * that would overflow. The two real panels are >=320, so both still land on 2x/3x — this only guards the
@@ -84,7 +108,7 @@ Host::Host(int windowWidth, int windowHeight) {
 }
 
 void Host::oneTimeSetup(Audio *audio) {
-    (void)audio;
+    s_audio = audio;   /* kept for the core-1 audio_task; see the audio bring-up at the end of this function */
     /* Build the RGB565 palette LUT from the base colours. setUpPaletteColors() must have run first. */
     for (int i = 0; i < 144; i++) {
         s_lut[i] = board_lcd_rgb565(_paletteColors[i].Red, _paletteColors[i].Green, _paletteColors[i].Blue);
@@ -114,6 +138,22 @@ void Host::oneTimeSetup(Audio *audio) {
                                                          * the touch deck (input_touch.c) uses the same tone. */
     ESP_LOGI(TAG, "oneTimeSetup done (strip=%p, %dx%d game @ %d,%d, %dx scale on %dx%d panel)",
              s_strip, s_dst_w, s_dst_h, s_ox, s_oy, s_scale, s_panel_w, s_panel_h);
+
+    /* Audio: bring up the board's codec (if any). The Host owns a small stereo buffer that fake-08 fills
+     * each loop (poll path); playFilledAudioBuffer blocks in the I2S write, self-pacing the loop. A board
+     * with no audio (board_audio_init != 0) leaves s_audio_ok false and the Host runs silent. */
+    s_audio_ok = (s_audio != nullptr && board_audio_init() == 0);
+    if (s_audio_ok) {
+        s_audio_buf = (int16_t *)heap_caps_malloc(AUDIO_FRAMES * 2 * sizeof(int16_t), MALLOC_CAP_DEFAULT);
+        if (!s_audio_buf) s_audio_ok = false;
+    }
+    if (s_audio_ok) {
+        /* Pin to core 1 so the ~10 ms/buffer synth never steals from the 60 Hz game loop on core 0. Prio
+         * above idle; it yields every buffer in the blocking I2S write, which also feeds the task watchdog. */
+        xTaskCreatePinnedToCore(audio_task, "audio", 8192, nullptr, 6, &s_audio_task, 1);
+    }
+    ESP_LOGI(TAG, "audio %s", s_audio_ok ? "enabled (ES8311, core-1 task, 22050 Hz S16 stereo)"
+                                         : "disabled (no board audio)");
 }
 
 void Host::oneTimeCleanup() {
@@ -155,6 +195,8 @@ void Host::waitForTargetFps() {
         s_last = now;
     }
 #endif
+    /* Frame pacing (video). Audio now lives on the core-1 task, so this is the sole pacer again — it holds
+     * the game loop at 60 Hz on core 0 (the cart self-divides to its logical 30/60 fps; audio is independent). */
     if (s_next_frame_us == 0) s_next_frame_us = now;
     s_next_frame_us += s_frame_period_us;
     int64_t wait_us = s_next_frame_us - now;
@@ -215,9 +257,12 @@ bool Host::shouldQuit()        { return false; }
 void Host::changeStretch()     { }
 void Host::forceStretch(StretchOption newStretch) { (void)newStretch; }
 
+/* The game loop must NOT fill audio — the core-1 audio_task pulls from the synth engine directly and does
+ * the blocking I2S write, so audio pacing is off the game loop (which stays at 60 Hz via the video timer).
+ * Returning false here makes fake-08's GameLoop skip its inline fill/play entirely. */
 bool   Host::shouldFillAudioBuff()   { return false; }
-void  *Host::getAudioBufferPointer() { return nullptr; }
-size_t Host::getAudioBufferSize()    { return 0; }
+void  *Host::getAudioBufferPointer() { return s_audio_buf; }
+size_t Host::getAudioBufferSize()    { return AUDIO_FRAMES; }   /* stereo frames (uint32 units), NOT bytes */
 void   Host::playFilledAudioBuffer() { }
 
 double Host::deltaTMs() { return (double)s_frame_period_us / 1000.0; }
