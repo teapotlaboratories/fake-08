@@ -80,6 +80,15 @@ class Vm {
     // void UpdateAndDraw();
     bool Step();
 
+    // GC control for the host loop (perf): let the host disable the automatic incremental collector and drive
+    // it in bounded slices between frames — so a big collection spreads over several frames instead of
+    // stalling one, and the slice can be overlapped with the host's Lua-free blit. Thin lua_gc wrappers.
+    void GcSetAuto(bool on);   // GCRESTART / GCSTOP
+    int  GcStep(int kb);       // GCSTEP: returns 1 when a collection cycle just completed
+    int  GcCountKb();          // GCCOUNT: live Lua memory in KiB (watch it / guard against runaway growth)
+    void GcSetGenerational();  // GCGEN: switch to generational mode (cheap minor collections of young garbage)
+    void GcSetMajorInc(int p); // GCSETMAJORINC: heap-growth %% before a (costly) major collection in gen mode
+
     uint8_t* GetPicoInteralFb();
     uint8_t* GetScreenPaletteMap();
 
