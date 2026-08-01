@@ -664,6 +664,13 @@ bool Vm::Step(){
     return ret;
 }
 
+// GC control — thin wrappers over lua_gc on the cart's state, for the host loop to bound + offload collection.
+void Vm::GcSetAuto(bool on){ lua_gc(_luaState, on ? LUA_GCRESTART : LUA_GCSTOP, 0); }
+int  Vm::GcStep(int kb){ return lua_gc(_luaState, LUA_GCSTEP, kb); }
+int  Vm::GcCountKb(){ return lua_gc(_luaState, LUA_GCCOUNT, 0); }
+void Vm::GcSetGenerational(){ lua_gc(_luaState, LUA_GCGEN, 0); }
+void Vm::GcSetMajorInc(int p){ lua_gc(_luaState, LUA_GCSETMAJORINC, p); }
+
 // void Vm::UpdateAndDraw() {
 //     update_buttons();
 
