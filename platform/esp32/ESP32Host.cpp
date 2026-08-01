@@ -58,6 +58,7 @@ static uint16_t  s_lut[144];        /* PICO-8 colour index -> RGB565 (board byte
  * falls back to slow PSRAM; a strip (s_dst_w * s_strip_rows: 16 KB at 2x, 36 KB at 3x) stays in fast SRAM,
  * keeping the per-pixel writes AND the blit DMA there. */
 static uint16_t *s_strip = nullptr;
+static uint8_t  *s_fb_shadow = nullptr;   /* last-blitted pico framebuffer, to skip re-blitting an unchanged frame */
 
 /* Audio runs on a task pinned to CORE 1, decoupled from the game loop (core 0). fake-08's per-sample synth
  * uses double math, which is soft-float on the P4's single-precision FPU (~10 ms per buffer); running it
@@ -129,6 +130,13 @@ void Host::oneTimeSetup(Audio *audio) {
     s_ox = (s_panel_w - s_dst_w) / 2;
     if (s_ox < 0) s_ox = 0;
     s_oy = 0;
+    /* Shadow of the last-blitted pico framebuffer. A 30 fps cart yields TWICE per game-frame (one bare yield
+     * that draws nothing, then _draw()+flip()), but the host loop blits after every Step — so ~half the blits
+     * re-present an unchanged framebuffer. drawFrame() skips those by memcmp against this shadow (~us) instead
+     * of paying the ~6 ms upscale+blit. 0xFF-init forces the first frame to blit. */
+    s_fb_shadow = (uint8_t *)heap_caps_malloc((size_t)PICO_W * PICO_H / 2, MALLOC_CAP_INTERNAL);
+    if (s_fb_shadow) memset(s_fb_shadow, 0xff, (size_t)PICO_W * PICO_H / 2);
+    else ESP_LOGW(TAG, "no fb shadow — every Step will blit (no unchanged-frame skip)");
     board_lcd_fill(board_lcd_rgb565(0x0f, 0x14, 0x1d)); /* fill the letterbox/deck once — subtle dark
                                                          * surface (mockup's deck colour), not pure black;
                                                          * the touch deck (input_touch.c) uses the same tone. */
@@ -204,32 +212,42 @@ void Host::waitForTargetFps() {
     }
 }
 
-void Host::drawFrame(uint8_t *picoFb, uint8_t *screenPaletteMap, uint8_t drawMode) {
-    (void)drawMode; /* draw-only milestone: only the default draw mode */
-    if (!s_strip) return;
-    /* Straight mapping: pico (x,y) -> panel (2x,2y), matching the HG display path (host_main.cpp); the
-     * panel renders this UPRIGHT. Built + blitted in strips so the buffer stays in fast internal SRAM.
-     * The nibble-unpack is inlined (read one byte -> two pixels) to avoid a per-pixel getPixelNibble call.
-     * NOTE: the bench camera is mounted 90deg rotated (bench-rig-gotchas: "LEFT of frame = TOP of panel")
-     * — a raw /capture looks rotated and must be turned 90deg CW before judging. Do not correct it here. */
+/* The actual upscale + panel blit, reading a fixed fb (4bpp, 2 px/byte) + palette. Straight mapping pico
+ * (x,y) -> panel (sc*x, sc*y); built + blitted in strips so the working buffer stays in fast internal SRAM.
+ * The nibble-unpack is inlined (one byte -> two pixels) to avoid a per-pixel call. */
+static void host_blit(const uint8_t *fb, const uint8_t *pal) {
     const int sc = s_scale;
     for (int sy = 0; sy < PICO_H; sy += STRIP_PR) {
         for (int ry = 0; ry < STRIP_PR; ry++) {
-            const uint8_t *src = picoFb + ((sy + ry) << 6); /* pico row base: *64 (4bpp, 2 px/byte) */
-            uint16_t *row0 = s_strip + (ry * sc) * s_dst_w; /* first of `sc` destination rows */
+            const uint8_t *src = fb + ((sy + ry) << 6);
+            uint16_t *row0 = s_strip + (ry * sc) * s_dst_w;
             for (int x = 0; x < PICO_W; x += 2) {
                 uint8_t b = src[x >> 1];
-                uint16_t c0 = s_lut[screenPaletteMap[b & 0x0f] & 0x8f]; /* even x: low nibble  */
-                uint16_t c1 = s_lut[screenPaletteMap[b >> 4]   & 0x8f]; /* odd  x: high nibble */
+                uint16_t c0 = s_lut[pal[b & 0x0f] & 0x8f];
+                uint16_t c1 = s_lut[pal[b >> 4]   & 0x8f];
                 int dx = x * sc;
-                for (int k = 0; k < sc; k++) row0[dx + k] = c0;         /* sc horizontal copies each */
+                for (int k = 0; k < sc; k++) row0[dx + k] = c0;
                 for (int k = 0; k < sc; k++) row0[dx + sc + k] = c1;
             }
-            for (int k = 1; k < sc; k++)                                /* replicate the row `sc-1` times */
+            for (int k = 1; k < sc; k++)
                 memcpy(row0 + (size_t)k * s_dst_w, row0, (size_t)s_dst_w * sizeof(uint16_t));
         }
         board_lcd_blit(s_ox, s_oy + (sy * sc), s_dst_w, s_strip_rows, s_strip);
     }
+}
+
+void Host::drawFrame(uint8_t *picoFb, uint8_t *screenPaletteMap, uint8_t drawMode) {
+    (void)drawMode; /* draw-only milestone: only the default draw mode */
+    if (!s_strip) return;
+    /* Skip re-blitting an unchanged framebuffer: a 30 fps cart presents the SAME fb on its bare-yield Step, so
+     * ~half the host's per-Step blits are redundant. memcmp of the 8 KB fb is ~us vs the ~6 ms blit it saves.
+     * (Palette-only changes with no pixel change wait for the next real draw — PICO-8 carts pal() inside _draw.) */
+    if (s_fb_shadow) {
+        const size_t fbsz = (size_t)PICO_W * PICO_H / 2;
+        if (memcmp(s_fb_shadow, picoFb, fbsz) == 0) return;   /* nothing changed -> keep the panel as-is */
+        memcpy(s_fb_shadow, picoFb, fbsz);
+    }
+    host_blit(picoFb, screenPaletteMap);
 }
 
 InputState_t Host::scanInput() {
