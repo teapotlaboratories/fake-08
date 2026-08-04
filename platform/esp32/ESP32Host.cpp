@@ -191,12 +191,15 @@ void Host::waitForTargetFps() {
         if (s_last) {
             s_acc += now - s_last;
             if (++s_cnt >= 30) {
-                int fps = (int)(1e6 * s_cnt / (double)s_acc + 0.5);
-                if (fps != s_shown) { board_lcd_draw_fps(fps); s_shown = fps; }
+                s_shown = (int)(1e6 * s_cnt / (double)s_acc + 0.5);
                 s_acc = 0; s_cnt = 0;
             }
         }
         s_last = now;
+        /* Repaint every tick so the HUD survives a game that blits over its position (on the P4 the game fills
+         * the panel width and covers the HUD spot — repainting only on value change left it drawn once then
+         * overwritten). The box is tiny; the per-frame cost is negligible. */
+        if (s_shown >= 0) board_lcd_draw_fps(s_shown);
     }
 #endif
     /* Frame pacing (video). Audio now lives on the core-1 task, so this is the sole pacer again — it holds
@@ -304,7 +307,31 @@ std::vector<std::string> Host::listcarts() {
     }
     return carts;
 }
-std::vector<std::string> Host::listdirs()  { return {}; } /* not needed for the first-cart milestone */
+/* Scan _cartDirectory for subdirectories so the DefaultCart browser can navigate a foldered cart
+ * library (e.g. a card laid out by genre). An entry is a directory if it can itself be opendir'd —
+ * FatFs on esp-idf doesn't populate dirent.d_type, so the portable stat-free probe from the gcw0
+ * port is used. '.'/'..' and dotfiles are skipped. Pairs with listcarts (same _cartDirectory), which
+ * ChangeDirectory() repoints as the user descends/ascends. Ported from platform/gcw0 (ODHost.cpp). */
+std::vector<std::string> Host::listdirs() {
+    std::vector<std::string> dirs;
+    DIR *dir;
+    struct dirent *ent;
+    if ((dir = opendir(_cartDirectory.c_str())) != NULL) {
+        while ((ent = readdir(dir)) != NULL) {
+            if (ent->d_name[0] == '.') {
+                continue;
+            }
+            std::string fullPath = _cartDirectory + "/" + ent->d_name;
+            DIR *testDir = opendir(fullPath.c_str());
+            if (testDir != NULL) {
+                closedir(testDir);
+                dirs.push_back(ent->d_name);
+            }
+        }
+        closedir(dir);
+    }
+    return dirs;
+}
 std::string Host::getCartDirectory()       { return _cartDirectory; }
 const char *Host::logFilePrefix()          { return ""; }
 std::string Host::customBiosLua()          { return ""; }
