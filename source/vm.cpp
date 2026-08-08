@@ -344,6 +344,9 @@ bool abortLua;
 
 
 bool Vm::loadCart(Cart* cart) {
+    /* Every cart load goes through here, so this is the one place a pending quit-to-host cannot survive into
+     * the next cart (see Vm::RequestQuitToHost). */
+    _quitToHost = false;
     _picoFrameCount = 0;
 
     _cartdataKeyCount = 0;
@@ -875,6 +878,7 @@ void Vm::GameLoop() {
         _host->waitForTargetFps();
 
         if (_host->shouldQuit()) break; // break in order to return to hbmenu
+        if (_quitToHost) break;        // extcmd("exit_to_host") — hand control back to the embedding app
         //this should probably be handled just in the host class
         _host->changeStretch();
 
@@ -896,6 +900,9 @@ void Vm::GameLoop() {
         }
     }
 }
+
+void Vm::RequestQuitToHost() { _quitToHost = true; }
+bool Vm::QuitToHostRequested() const { return _quitToHost; }
 
 bool Vm::ExecuteLua(string luaString, string callbackFunction) {
     // Get the sandbox environment
@@ -1329,6 +1336,10 @@ void Vm::vm_extcmd(std::string cmd){
     }
     else if (cmd == "shutdown") {
         QueueCartChange(DefaultCartName);
+    }
+    else if (cmd == "exit_to_host") {
+        /* Not a PICO-8 verb: an embedding host's way out. See Vm::RequestQuitToHost(). */
+        RequestQuitToHost();
     }
 }
 
