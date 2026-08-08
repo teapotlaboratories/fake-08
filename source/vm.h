@@ -42,6 +42,10 @@ class Vm {
     /* Set by extcmd("exit_to_host"). Breaks GameLoop so the embedding app regains control — see
      * RequestQuitToHost(). Distinct from _host->shouldQuit(), which is the platform's own quit signal. */
     bool _quitToHost = false;
+    /* Opt-in gate. extcmd() is reachable by ANY cart, so the exit_to_host verb stays inert unless the
+     * embedding host explicitly arms it — otherwise a downloaded cart could quit fake-08 on platforms whose
+     * main() treats a GameLoop return as "exit the program". */
+    bool _quitToHostEnabled = false;
     bool _pauseMenu;
     bool _clearInputOnResume;
     string _prevCartKey;
@@ -121,8 +125,10 @@ class Vm {
      * that embeds fake-08 inside its own UI (a launcher, a shell) needs a way back that is not a reboot;
      * carts reach it with extcmd("exit_to_host"), which is how a menuitem() entry can offer "exit". Cleared
      * on every cart load so it cannot leak into the next cart. */
+    void EnableQuitToHost(bool enabled);   /* default OFF — see _quitToHostEnabled */
     void RequestQuitToHost();
     bool QuitToHostRequested() const;
+    void ClearQuitToHost();
 
     PicoRam* getPicoRam();
 
