@@ -866,6 +866,10 @@ string Vm::GetBiosError() {
 
 void Vm::GameLoop() {
     Logger_Write("Start of GameLoop()\n");
+    /* Clear on ENTRY, not on cart load: a stale flag would make every later GameLoop() return immediately,
+     * and clearing it in loadCart() would silently swallow an exit requested in the same frame as a cart
+     * change. Entry is the one point where "nobody has asked to leave yet" is unambiguously true. */
+    _quitToHost = false;
     while (_host->shouldRunMainLoop())
     {
         //shouldn't need to set this every frame
@@ -875,6 +879,15 @@ void Vm::GameLoop() {
         _host->waitForTargetFps();
 
         if (_host->shouldQuit()) break; // break in order to return to hbmenu
+        if (_quitToHost) {             // extcmd("exit_to_host") — hand control back to the embedding app
+            /* Leave the VM resumable. A menu item picked with left/right runs its callback WITHOUT
+             * __togglepausemenu(), so the pause flag and paused audio would otherwise survive into whatever
+             * the host runs next — leaving the next cart frozen behind a pause overlay and silent. */
+            _pauseMenu = false;
+            _clearInputOnResume = true;
+            if (_audio) _audio->setPaused(false);
+            break;
+        }
         //this should probably be handled just in the host class
         _host->changeStretch();
 
@@ -896,6 +909,11 @@ void Vm::GameLoop() {
         }
     }
 }
+
+void Vm::EnableQuitToHost(bool enabled) { _quitToHostEnabled = enabled; }
+void Vm::RequestQuitToHost() { if (_quitToHostEnabled) _quitToHost = true; }
+bool Vm::QuitToHostRequested() const { return _quitToHost; }
+void Vm::ClearQuitToHost() { _quitToHost = false; }
 
 bool Vm::ExecuteLua(string luaString, string callbackFunction) {
     // Get the sandbox environment
@@ -1329,6 +1347,11 @@ void Vm::vm_extcmd(std::string cmd){
     }
     else if (cmd == "shutdown") {
         QueueCartChange(DefaultCartName);
+    }
+    else if (cmd == "exit_to_host") {
+        /* Not a PICO-8 verb: an embedding host's way out. Ignored unless the host armed it, because extcmd is
+         * cart-reachable and a GameLoop return means "quit the program" on most platforms. */
+        RequestQuitToHost();
     }
 }
 
