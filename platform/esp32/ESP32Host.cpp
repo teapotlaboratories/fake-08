@@ -270,7 +270,22 @@ InputState_t Host::scanInput() {
 }
 
 bool Host::shouldRunMainLoop() { return true; }
-bool Host::shouldQuit()        { return false; }
+
+/* Host::shouldQuit is fake-08's own way out of Vm::GameLoop() ("break in order to return to hbmenu",
+ * vm.cpp) and it was stubbed to false here, so the loop never returned and an app embedding fake-08 inside
+ * its own UI had no way back short of a reboot.
+ *
+ * Rather than invent a new seam, the app hands us a byte to watch and the value that means "leave". It points
+ * at PICO-8 RAM — the app puts it in the GPIO area (0x5f80..0x5fff), the documented cart<->host channel — so a
+ * pause-menu item registered with menuitem() can poke it from Lua and land here without any change to shared
+ * fake-08 code. Unset by default, so a host that never calls this behaves exactly as before. */
+static const uint8_t *s_exit_watch = nullptr;
+static uint8_t        s_exit_magic = 0;
+extern "C" void esp32host_watch_exit(const uint8_t *addr, uint8_t magic) {
+    s_exit_watch = addr;
+    s_exit_magic = magic;
+}
+bool Host::shouldQuit()        { return s_exit_watch && *s_exit_watch == s_exit_magic; }
 void Host::changeStretch()     { }
 void Host::forceStretch(StretchOption newStretch) { (void)newStretch; }
 
